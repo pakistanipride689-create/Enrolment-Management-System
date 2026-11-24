@@ -256,9 +256,19 @@ def _smtp_login():
     """Connect to the sender account (Gmail / Outlook ...) and log in with the saved sender e-mail + password -> server object."""
     if not (cfg['mail_server'] and cfg['mail_user'] and cfg['mail_pass']): raise ValueError('enter the sender e-mail settings (server, e-mail, password)')
     port, ctx = int(cfg['mail_port']), ssl.create_default_context()
-    s = smtplib.SMTP_SSL(cfg['mail_server'], port, timeout=90, context=ctx) if port == 465 else smtplib.SMTP(cfg['mail_server'], port, timeout=90)
+    s, errs = None, []
+    for p in [port] + [x for x in (587, 465) if x != port]:                         # the network may close one of the two usual ports
+        try:
+            s = smtplib.SMTP_SSL(cfg['mail_server'], p, timeout=60, context=ctx) if p == 465 else smtplib.SMTP(cfg['mail_server'], p, timeout=60)
+            if p != 465: s.starttls(context=ctx)
+            break
+        except Exception as e:
+            errs.append(f'port {p}: {e}')
+            try: s.close()
+            except Exception: pass
+            s = None
+    if s is None: raise ValueError('cannot connect to the mail server (' + '; '.join(errs) + '). Check the SMTP server name (smtp.gmail.com) - or the network / firewall blocks e-mail ports 587 and 465: ask IT to open them.')
     try:
-        if port != 465: s.starttls(context=ctx)
         pw = cfg['mail_pass'].replace(' ', '') if any(k in cfg['mail_server'].lower() for k in ('gmail', 'google')) else cfg['mail_pass']   # Google shows App passwords in groups with spaces
         try: s.login(cfg['mail_user'].strip(), pw)
         except smtplib.SMTPAuthenticationError: raise ValueError('the mail server refused the login - check the sender e-mail and password (Gmail needs a 16-letter App password, not the normal password)')
@@ -1073,9 +1083,7 @@ class Dev:
         try: c = self.z.GetStrCardNumber()
         except Exception as e:
             self.card_err = self.card_err or repr(e); return ''
-        if isinstance(c, tuple):
-            if c and c[0] is False: return ''
-            c = c[-1] if c else ''
+        if isinstance(c, tuple): c = c[-1] if c else ''           # these machines answer (False, '4547684'): the flag is not reliable, the number is
         c = str(c if c is not None else '').strip()
         return '' if c in ('', '0') else c
 
@@ -1095,16 +1103,6 @@ class Dev:
             except Exception as e: self.card_err = self.card_err or repr(e)
             hit = hit or bool(u['card'])
         for u in todo: CARD_SEEN[(self.ip, u['id'])] = now
-        if out and not any(u['card'] for u in out) and now - CARD_SEEN.get((self.ip, '*old'), 0) > 21600:      # third way: the older SDK call (GetAllUserInfo), once in 6 hours
-            CARD_SEEN[(self.ip, '*old')] = now
-            try:
-                self.z.ReadAllUserID(1); byid = {u['id']: u for u in out}
-                while True:
-                    r = self.z.GetAllUserInfo(1)
-                    if not r[0]: break
-                    cd, u = self._card_now(), byid.get(str(r[1]))
-                    if u is not None and cd: u['card'] = cd
-            except Exception as e: self.card_err = self.card_err or 'GetAllUserInfo: ' + repr(e)
         n = sum(1 for u in out if u['card'])
         if CARD_LOGGED.get(self.ip) != n:
             CARD_LOGGED[self.ip] = n
