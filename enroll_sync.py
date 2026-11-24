@@ -1049,6 +1049,7 @@ def load_cached_list():
 FACE_INDEX = 50                                   # ZKTeco SDK: face template slot used by the UFace / iFace models
 
 
+CARD_DIAG = set()
 CARD_SEEN, CARD_LOGGED = {}, {}                       # (machine ip, user id) -> time the card was last looked for the second way;  ip -> number of cards seen (logged when it changes)
 
 
@@ -1094,11 +1095,33 @@ class Dev:
             except Exception as e: self.card_err = self.card_err or repr(e)
             hit = hit or bool(u['card'])
         for u in todo: CARD_SEEN[(self.ip, u['id'])] = now
+        if out and not any(u['card'] for u in out) and now - CARD_SEEN.get((self.ip, '*old'), 0) > 21600:      # third way: the older SDK call (GetAllUserInfo), once in 6 hours
+            CARD_SEEN[(self.ip, '*old')] = now
+            try:
+                self.z.ReadAllUserID(1); byid = {u['id']: u for u in out}
+                while True:
+                    r = self.z.GetAllUserInfo(1)
+                    if not r[0]: break
+                    cd, u = self._card_now(), byid.get(str(r[1]))
+                    if u is not None and cd: u['card'] = cd
+            except Exception as e: self.card_err = self.card_err or 'GetAllUserInfo: ' + repr(e)
         n = sum(1 for u in out if u['card'])
         if CARD_LOGGED.get(self.ip) != n:
             CARD_LOGGED[self.ip] = n
             log(f'{self.ip}: RFID cards read from the machine: {n} of {len(out)} users' + (f'  (card read error: {self.card_err})' if self.card_err and not n else ''))
+        if out and not n and self.ip not in CARD_DIAG:
+            CARD_DIAG.add(self.ip); log(f'{self.ip}: RFID diagnostic - ' + self.card_diag(out[:3]))
         return out
+
+    def card_diag(self, users):
+        """What the machine answers to the card question for the first users (no passwords) - for finding out why no card is read."""
+        bits = []
+        for u in users:
+            try:
+                ok = self.z.SSR_GetUserInfo(1, u['id'])[0]; c = self.z.GetStrCardNumber()
+                bits.append(f'ID {u["id"]}: user read={ok}, card answer={c!r}')
+            except Exception as e: bits.append(f'ID {u["id"]}: {e!r}')
+        return ' | '.join(bits)
 
     def templates(self, uid):
         """-> {'fp': [(finger index, data)], 'face': (data, length) or None}"""
