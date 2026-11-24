@@ -75,10 +75,11 @@ def _default_machines():
 
 
 cfg = {'enroller': '', 'port': 4370, 'comm_key': 0, 'interval': 60, 'bulk': False, 'purge': True, 'machines': None,
-       'list_url': 'https://hrms1.mydecibel.com/TMS/CustomAttendanceReport.aspx?ReportIndex=1839', 'login_url': 'https://bpo.mydecibel.com/login.aspx', 'list_min': 60, 'del_leavers': True, 'dc_user': 'ST.404473', 'dc_pass': 'Ahmed!@4190',
+       'list_url': 'https://mydecibel.com/EDM/Originate.aspx?AR=none&ReportIndex=278', 'login_url': 'https://bpo.mydecibel.com/login.aspx', 'list_min': 60, 'del_leavers': True, 'dc_user': 'ST.404473', 'dc_pass': 'Ahmed!@4190',
        'backup_dir': '', 'scan_hours': 24, 'last_full': 0,
        'mail_on': True, 'mail_to': '', 'mail_server': 'smtp.gmail.com', 'mail_port': 587, 'mail_user': '', 'mail_pass': '', 'mail_time': '20:00', 'mail_last': ''}
 cfg.update(load_json(CFG_FILE, {}))
+if 'reportindex=1839' in str(cfg.get('list_url', '')).lower(): cfg['list_url'] = 'https://mydecibel.com/EDM/Originate.aspx?AR=none&ReportIndex=278'      # old Attendance Register link -> new employee report (ReportIndex=278)
 cfg['list_url'] = cfg.get('list_url', '').replace('CustomAttendanceReport.aspx?&ReportIndex', 'CustomAttendanceReport.aspx?ReportIndex')   # old saved link -> link of the steps file
 if not cfg.get('dc_user') or not cfg.get('dc_pass'): cfg['dc_user'], cfg['dc_pass'] = 'ST.404473', 'Ahmed!@4190'                   # User ID / Password of step 2
 if not cfg.get('machines'):                                                   # first run, or settings of the older version (fixed IN / OUT rows)
@@ -504,7 +505,7 @@ def _dc_has_login(page, url=''):
         pws = [e for e in f['els'] if e['t'] == 'password']
         if not pws: continue
         names = ' '.join((e.get('n') or '') for e in f['els']).lower()
-        if 'btn_getreport' in names or 'ddl_companyname' in names: continue          # the report page (with its hidden Change Password box)
+        if 'btn_getreport' in names or 'pb_getreport' in names or 'ddl_companyname' in names or 'cbl_fields' in names: continue          # the report page (with its hidden Change Password box)
         if len(pws) == 1 or 'login' in url.lower(): return True
     return False
 
@@ -682,6 +683,9 @@ MONTHS = ('January', 'February', 'March', 'April', 'May', 'June', 'July', 'Augus
 COMPANY_WORD = 'service tyre'                      # the company to pick: "Service Tyres Private Limited"
 
 
+def _dc_getbtn(form): return _dc_name(form, 'pb_GetReport') or _dc_name(form, 'btn_GetReport')
+
+
 ALT_HOST = 'https://mydecibel.com'                 # the main Decibel site (the kiosk's login page): second way in if the HRMS portal login cannot be used
 
 
@@ -720,10 +724,10 @@ def _decibel_register(url, user, pw, login_url=''):
             m = re.search(r'.{0,80}(invalid|incorrect|wrong|not correct|captcha|locked|expired|blocked|inactive|does not exist|disabled|authenticat).{0,120}', _dc_plain(ses.after_login or ses.page).split('Change Password')[0], re.I)
             raise LoginFailed(('Decibel did not accept the login' if not ok else 'Decibel accepted the login but asked for it again on the report page (session not kept)')
                               + (f' (Decibel says: {m.group(0).strip()})' if m else '') + f'. Pressed: {", ".join(ses.tried) or "nothing"}. Login page controls: {controls}')
-    elif not any(_dc_name(f, 'btn_GetReport') for f in _dc_forms(ses.page)) and login_url:
+    elif not any(_dc_getbtn(f) for f in _dc_forms(ses.page)) and login_url:
         ses.go(login_url)
         if ses.login_on(): ses.go(url)
-    report = lambda: next((f for f in _dc_forms(ses.page) if _dc_name(f, 'btn_GetReport')), None)
+    report = lambda: next((f for f in _dc_forms(ses.page) if _dc_getbtn(f)), None)
     form = report()
     if not form:
         dump('last_report_page.html', ses.page)
@@ -743,7 +747,11 @@ def _decibel_register(url, user, pw, login_url=''):
     over = {'__EVENTTARGET': '', '__EVENTARGUMENT': '', n: cv}
     ex = _dc_name(form, 'cb_ExportToExcel')
     if ex: over[ex] = 'on'
-    dated = False                                                                  # 2) From / To = today (text boxes tb_CheckIn / tb_CheckOut, or day / month / year lists)
+    new_rep = any((e.get('n') or '').lower().find('cbl_fields') >= 0 for e in form['els'])
+    if new_rep:                                                                    # employee report (ReportIndex=278): only Emp ID (Fields$1) + Service End Date (Fields$25)
+        for e in form['els']:
+            if e['t'] == 'checkbox' and e.get('n') and 'cbl_fields' in e['n'].lower(): over[e['n']] = e['v'] if e['n'].split('$')[-1] in ('1', '25') else None
+    dated = False                                                                  # 2) From / To = today (old register page only) (text boxes tb_CheckIn / tb_CheckOut, or day / month / year lists)
     for suf in ('tb_CheckIn', 'tb_CheckOut'):
         e = next((e for e in form['els'] if e.get('n') and e['n'].lower().endswith(suf.lower())), None)
         if e: over[e['n']] = _dc_date(today, e.get('v')); dated = True
@@ -751,9 +759,9 @@ def _decibel_register(url, user, pw, login_url=''):
         for suf, val in (('Day', today.day), ('Month', today.month), ('Year', today.year)):
             sn, ov = _dc_option(form, f'ddl_{pre}{suf}', want=val)
             if sn and ov is not None: over[sn] = ov; dated = True
-    if not dated:
+    if not dated and not new_rep:
         dump('last_report_page.html', ses.page); raise ValueError('From Date / To Date fields not found on the register page')
-    hd, body = ses.go(action, _dc_payload(form, over, _dc_name(form, 'btn_GetReport')))       # 3) Get Report
+    hd, body = ses.go(action, _dc_payload(form, over, _dc_getbtn(form)))       # 3) Get Report
     if not body.strip() or (b'<table' not in body.lower() and body[:2] != b'PK' and body[:4] != b'\xd0\xcf\x11\xe0' and b',' not in body[:2000]):
         dump('last_download.html', body); raise ValueError('Decibel did not send a register (saved as last_download.html in the EnrollSync settings folder)')
     return body
@@ -817,7 +825,7 @@ def _decibel_browser(url, user, pw):
 
     vis = lambda css: [e for e in drv.find_elements(By.CSS_SELECTOR, css) if e.is_displayed()]
     pick = lambda suf: next(iter(drv.find_elements(By.CSS_SELECTOR, f"[id$='{suf}'],[name$='{suf}']")), None)
-    on_report = lambda: pick('btn_GetReport') is not None
+    on_report = lambda: pick('pb_GetReport') is not None or pick('btn_GetReport') is not None
 
     def body_text():
         try: return ' '.join(drv.find_element(By.TAG_NAME, 'body').text.split())[:300]
@@ -859,34 +867,67 @@ def _decibel_browser(url, user, pw):
             try: drv.save_screenshot(os.path.join(APP, 'last_report.png'))
             except Exception: pass
             raise ValueError('Attendance Register page not recognised (the Get Report button was not found) - saved as last_report_page.html / last_report.png in the EnrollSync settings folder')
-        co = pick('ddl_CompanyName')                                                  # ---- company
-        if co is None: raise ValueError('company list (ddl_CompanyName) not found on the register page')
-        sel = Select(co); opt = next((o for o in sel.options if COMPANY_WORD in ' '.join(o.text.lower().split())), None)
-        if opt is None: raise ValueError('company "Service Tyres Private Limited" not in the list of the register page')
-        if not opt.is_selected():
-            sel.select_by_visible_text(opt.text)                                       # the page may reload itself here
-            wait(lambda: gone(co), 6); wait(lambda: pick('btn_GetReport') is not None and pick('ddl_CompanyName') is not None, 30)
-            s2 = Select(pick('ddl_CompanyName'))
-            if COMPANY_WORD not in ' '.join(s2.first_selected_option.text.lower().split()): s2.select_by_visible_text(opt.text)
-        today = date.today(); dated = False                                           # ---- From / To = today
-        for suf in ('tb_CheckIn', 'tb_CheckOut'):
-            e = pick(suf)
-            if e is not None:
-                drv.execute_script("var e=arguments[0];e.removeAttribute('readonly');e.value=arguments[1];", e, _dc_date(today, e.get_attribute('value'))); dated = True
-        for pre in ('F', 'T'):
-            for suf, val in (('Day', today.day), ('Month', today.month), ('Year', today.year)):
-                e = pick(f'ddl_{pre}{suf}')
-                if e is not None:
-                    try: Select(e).select_by_value(str(val)); dated = True
+        new_mode = pick('pb_GetReport') is not None
+        if new_mode:                                                                  # ---- employee report (ReportIndex=278): Client, Emp ID, Service End Date, Export To Excel
+            def client_sel():
+                for sl in drv.find_elements(By.TAG_NAME, 'select'):
+                    try:
+                        if any(COMPANY_WORD in ' '.join(o.text.lower().split()) for o in sl.find_elements(By.TAG_NAME, 'option')): return sl
                     except Exception: pass
-        if not dated:
-            dump('last_report_page.html', drv.page_source); raise ValueError('From Date / To Date fields not found on the register page')
-        ex = pick('cb_ExportToExcel')
-        if ex is not None and not ex.is_selected(): drv.execute_script('arguments[0].checked=true;', ex)
+                return None
+            co = client_sel()
+            if co is None:
+                dump('last_report_page.html', drv.page_source); raise ValueError('Client list with \"Service Tyre Private Limited\" not found on the report page - saved as last_report_page.html in the EnrollSync settings folder')
+            sel = Select(co); opt = next(o for o in sel.options if COMPANY_WORD in ' '.join(o.text.lower().split()))
+            if not opt.is_selected():
+                sel.select_by_visible_text(opt.text)                                   # the page may reload itself here
+                wait(lambda: gone(co), 6); wait(lambda: pick('pb_GetReport') is not None and client_sel() is not None, 30)
+                s2 = Select(client_sel())
+                if COMPANY_WORD not in ' '.join(s2.first_selected_option.text.lower().split()): s2.select_by_visible_text(opt.text)
+            def box(suffix, label):
+                e = pick(suffix)
+                if e is not None: return e
+                for lb in drv.find_elements(By.TAG_NAME, 'label'):
+                    if ' '.join(lb.text.lower().split()) == label and lb.get_attribute('for'):
+                        f = drv.find_elements(By.ID, lb.get_attribute('for'))
+                        if f: return f[0]
+                return None
+            b_id, b_end = box('cbl_Fields_1', 'emp id'), box('cbl_Fields_25', 'service end date')
+            if b_id is None or b_end is None:
+                dump('last_report_page.html', drv.page_source); raise ValueError('Emp ID / Service End Date check boxes not found on the report page - saved as last_report_page.html in the EnrollSync settings folder')
+            keep = [b_id.get_attribute('id'), b_end.get_attribute('id')]
+            drv.execute_script("var k=arguments[0];document.querySelectorAll(\"input[type=checkbox][id*='cbl_Fields_']\").forEach(function(c){c.checked=(k.indexOf(c.id)>=0);});", keep)
+            ex = pick('cb_ExportToExcel')
+            if ex is not None and not ex.is_selected(): drv.execute_script('arguments[0].checked=true;', ex)
+        else:
+            co = pick('ddl_CompanyName')                                                  # ---- company
+            if co is None: raise ValueError('company list (ddl_CompanyName) not found on the register page')
+            sel = Select(co); opt = next((o for o in sel.options if COMPANY_WORD in ' '.join(o.text.lower().split())), None)
+            if opt is None: raise ValueError('company "Service Tyres Private Limited" not in the list of the register page')
+            if not opt.is_selected():
+                sel.select_by_visible_text(opt.text)                                       # the page may reload itself here
+                wait(lambda: gone(co), 6); wait(lambda: pick('btn_GetReport') is not None and pick('ddl_CompanyName') is not None, 30)
+                s2 = Select(pick('ddl_CompanyName'))
+                if COMPANY_WORD not in ' '.join(s2.first_selected_option.text.lower().split()): s2.select_by_visible_text(opt.text)
+            today = date.today(); dated = False                                           # ---- From / To = today
+            for suf in ('tb_CheckIn', 'tb_CheckOut'):
+                e = pick(suf)
+                if e is not None:
+                    drv.execute_script("var e=arguments[0];e.removeAttribute('readonly');e.value=arguments[1];", e, _dc_date(today, e.get_attribute('value'))); dated = True
+            for pre in ('F', 'T'):
+                for suf, val in (('Day', today.day), ('Month', today.month), ('Year', today.year)):
+                    e = pick(f'ddl_{pre}{suf}')
+                    if e is not None:
+                        try: Select(e).select_by_value(str(val)); dated = True
+                        except Exception: pass
+            if not dated:
+                dump('last_report_page.html', drv.page_source); raise ValueError('From Date / To Date fields not found on the register page')
+            ex = pick('cb_ExportToExcel')
+            if ex is not None and not ex.is_selected(): drv.execute_script('arguments[0].checked=true;', ex)
         for f in os.listdir(dl):
             try: os.remove(os.path.join(dl, f))
             except OSError: pass
-        drv.execute_script('arguments[0].click();', pick('btn_GetReport'))             # ---- Get Report
+        drv.execute_script('arguments[0].click();', pick('pb_GetReport') or pick('btn_GetReport'))             # ---- Get Report
         def got():
             fs = [f for f in os.listdir(dl) if not f.lower().endswith(('.crdownload', '.tmp'))]
             return os.path.join(dl, fs[0]) if fs else None
@@ -1628,7 +1669,7 @@ def start_auto():
 
 # ================================================================ Data tab: employee list
 d1o, d1 = make_card(bd, 'Employee list  (Decibel)'); d1o.pack(fill='x', padx=12, pady=(10, 6))
-note(d1, 'The tool logs in to Decibel, opens the Attendance Register, selects Service Tyres Private Limited, sets From / To Date = today and clicks Get Report. Employee ID + serviceenddate are read from it (01/01/1900 or a date from today on = active, an earlier date = left). '
+note(d1, 'The tool logs in to Decibel, opens the employee report (ReportIndex=278), selects Client = Service Tyre Private Limited, ticks Emp ID + Service End Date + Export To Excel and clicks Get Report. Employee ID + Service End Date are read from it (01/01/1900 or a date from today on = active, an earlier date = left). '
          'Any other Excel / CSV / Google Sheets link or a file path also works. Employees whose end date is before today are deleted from all machines and are never copied. The list is downloaded again on the timer below.').pack(anchor='w', pady=(0, 8))
 lr = tk.Frame(d1, bg='white'); lr.pack(fill='x', pady=3)
 lbl(lr, 'Employee list link', fg=INK, font=FB, width=18, anchor='w').pack(side='left'); ttk.Entry(lr, textvariable=list_url).pack(side='left', fill='x', expand=True)
