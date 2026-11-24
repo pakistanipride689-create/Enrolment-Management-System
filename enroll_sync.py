@@ -825,7 +825,15 @@ def _decibel_browser(url, user, pw):
 
     vis = lambda css: [e for e in drv.find_elements(By.CSS_SELECTOR, css) if e.is_displayed()]
     pick = lambda suf: next(iter(drv.find_elements(By.CSS_SELECTOR, f"[id$='{suf}'],[name$='{suf}']")), None)
-    on_report = lambda: pick('pb_GetReport') is not None or pick('btn_GetReport') is not None
+    co_ok = lambda t: re.search(r'servi(s|ce)\s*tyre', ' '.join(t.lower().split())) is not None      # "Service Tyre(s)" / "Servis Tyre(s)"
+
+    def client_sel():
+        for sl in drv.find_elements(By.TAG_NAME, 'select'):
+            try:
+                if any(co_ok(o.text) for o in sl.find_elements(By.TAG_NAME, 'option')): return sl
+            except Exception: pass
+        return None
+    on_report = lambda: pick('pb_GetReport') is not None or pick('btn_GetReport') is not None or (pick('cb_ExportToExcel') is not None and client_sel() is not None)
 
     def body_text():
         try: return ' '.join(drv.find_element(By.TAG_NAME, 'body').text.split())[:300]
@@ -867,23 +875,18 @@ def _decibel_browser(url, user, pw):
             try: drv.save_screenshot(os.path.join(APP, 'last_report.png'))
             except Exception: pass
             raise ValueError('Attendance Register page not recognised (the Get Report button was not found) - saved as last_report_page.html / last_report.png in the EnrollSync settings folder')
-        new_mode = pick('pb_GetReport') is not None
+        new_mode = pick('pb_GetReport') is not None or 'reportindex=278' in drv.current_url.lower() or (pick('cb_ExportToExcel') is not None and pick('ddl_CompanyName') is None and pick('tb_CheckIn') is None and pick('ddl_FDay') is None)
         if new_mode:                                                                  # ---- employee report (ReportIndex=278): Client, Emp ID, Service End Date, Export To Excel
-            def client_sel():
-                for sl in drv.find_elements(By.TAG_NAME, 'select'):
-                    try:
-                        if any(COMPANY_WORD in ' '.join(o.text.lower().split()) for o in sl.find_elements(By.TAG_NAME, 'option')): return sl
-                    except Exception: pass
-                return None
             co = client_sel()
             if co is None:
-                dump('last_report_page.html', drv.page_source); raise ValueError('Client list with \"Service Tyre Private Limited\" not found on the report page - saved as last_report_page.html in the EnrollSync settings folder')
-            sel = Select(co); opt = next(o for o in sel.options if COMPANY_WORD in ' '.join(o.text.lower().split()))
+                dump('last_report_page.html', drv.page_source); raise ValueError('Client list with \"Service Tyre(s) Private Limited\" not found on the report page - saved as last_report_page.html in the EnrollSync settings folder')
+            sel = Select(co); opt = next(o for o in sel.options if co_ok(o.text))
             if not opt.is_selected():
-                sel.select_by_visible_text(opt.text)                                   # the page may reload itself here
-                wait(lambda: gone(co), 6); wait(lambda: pick('pb_GetReport') is not None and client_sel() is not None, 30)
+                sel.select_by_visible_text(opt.text)                                   # the page reloads itself here: the fields + Get Report appear
+                wait(lambda: gone(co), 6); wait(lambda: pick('pb_GetReport') is not None and client_sel() is not None, 40)
                 s2 = Select(client_sel())
-                if COMPANY_WORD not in ' '.join(s2.first_selected_option.text.lower().split()): s2.select_by_visible_text(opt.text)
+                if not co_ok(s2.first_selected_option.text): s2.select_by_visible_text(opt.text)
+                wait(lambda: pick('pb_GetReport') is not None and pick('cbl_Fields_1') is not None, 20)
             def box(suffix, label):
                 e = pick(suffix)
                 if e is not None: return e
