@@ -150,7 +150,7 @@ def save_backup(u, t, source):
         else:
             c.execute('INSERT INTO users VALUES (?,?,?,?,?,?,?,?,?,?,"active",NULL,NULL)', (u['id'],) + new + (now, now, source))
         c.commit()
-        bits = [f'{len(fp)} fingerprint(s)' if fp else '', 'face' if face else '', 'RFID card' if card else '']
+        bits = [f'{len(fp)} fingerprint(s)' if fp else '', 'face' if face else '', 'RFID card ' + str(card) if card else '']
         ev('BACKUP', u['id'], u['name'], source, ('new: ' if not row else 'updated: ') + (', '.join(b for b in bits if b) or 'user data only'))
         return 'updated' if row else 'new'
     finally:
@@ -204,13 +204,35 @@ def export_report(path, d1, d2, kinds=None):
     wb.save(path); return len(rows)
 
 
-def export_backup_xlsx(path):
+BK_FILTERS = ['All employees', 'With RFID card', 'With face', 'With fingerprint', 'Only RFID card', 'Only face', 'Only fingerprint', 'No data (user only)', 'Deleted employees']
+
+
+def query_backup(search='', flt='All employees'):
+    """Backup list -> [(ID, name, RFID card, fingerprints, face, status, last updated)]. `search`: IDs (exact, several separated by comma / space), part of a name or of a card number."""
+    terms = [t.lower() for t in re.split(r'[;,\s]+', search.strip()) if t]
+    c = db()
+    try: rows = c.execute('SELECT id, name, card, fp, face, status, updated FROM users ORDER BY CAST(id AS INTEGER), id').fetchall()
+    finally: c.close()
+    out = []
+    for i, n, card, fp, face, st, upd in rows:
+        card = '' if card in (None, '', '0') else str(card); nfp = len(json.loads(fp)) if fp else 0; hf = bool(face)
+        if terms and not any(norm(t) == norm(i) or t in (n or '').lower() or t in card.lower() for t in terms): continue
+        ok = {'With RFID card': bool(card), 'With face': hf, 'With fingerprint': nfp > 0, 'Only RFID card': bool(card) and not hf and not nfp,
+              'Only face': hf and not card and not nfp, 'Only fingerprint': nfp > 0 and not card and not hf, 'No data (user only)': not card and not hf and not nfp,
+              'Deleted employees': st == 'deleted'}.get(flt, True)
+        if ok: out.append((i, n or '', card, nfp, 'Yes' if hf else 'No', st or '', upd or ''))
+    return out
+
+
+def export_backup_xlsx(path, search='', flt='All employees'):
     import openpyxl
+    keep = {r[0] for r in query_backup(search, flt)} if (search.strip() or flt != 'All employees') else None
     wb = openpyxl.Workbook(); ws = wb.active; ws.title = 'Backup'
     ws.append(['Employee ID', 'Name', 'RFID card', 'Fingerprints', 'Face', 'First backed up', 'Last updated', 'Status', 'Deleted on', 'Reason'])
     c = db()
     try:
-        for r in c.execute('SELECT id, name, card, fp, face, first_seen, updated, status, deleted_on, reason FROM users ORDER BY id'):
+        for r in c.execute('SELECT id, name, card, fp, face, first_seen, updated, status, deleted_on, reason FROM users ORDER BY CAST(id AS INTEGER), id'):
+            if keep is not None and r[0] not in keep: continue
             ws.append([r[0], r[1], r[2] if r[2] not in ('', '0') else '', len(json.loads(r[3])) if r[3] else 0, 'Yes' if r[4] else 'No', r[5], r[6], r[7], r[8] or '', r[9] or ''])
     finally:
         c.close()
@@ -1027,11 +1049,14 @@ def load_cached_list():
 FACE_INDEX = 50                                   # ZKTeco SDK: face template slot used by the UFace / iFace models
 
 
+CARD_SEEN, CARD_LOGGED = {}, {}                       # (machine ip, user id) -> time the card was last looked for the second way;  ip -> number of cards seen (logged when it changes)
+
+
 class Dev:
     """One machine through the ZKTeco SDK (COM object zkemkeeper.ZKEM)."""
     def __init__(self, ip, port, key):
         import pythoncom
-        pythoncom.CoInitialize(); self._co = pythoncom
+        pythoncom.CoInitialize(); self._co = pythoncom; self.ip, self.card_err = ip, ''
         from win32com.client import Dispatch, gencache
         try: self.z = gencache.EnsureDispatch('zkemkeeper.ZKEM')
         except Exception: self.z = Dispatch('zkemkeeper.ZKEM')
@@ -1042,17 +1067,37 @@ class Dev:
     def enable(self): self.z.EnableDevice(1, True)
     def refresh(self): self.z.RefreshData(1)
 
+    def _card_now(self):
+        """RFID card number of the user just read (SDK GetStrCardNumber) - '' when the user has none."""
+        try: c = self.z.GetStrCardNumber()
+        except Exception as e:
+            self.card_err = self.card_err or repr(e); return ''
+        if isinstance(c, tuple):
+            if c and c[0] is False: return ''
+            c = c[-1] if c else ''
+        c = str(c if c is not None else '').strip()
+        return '' if c in ('', '0') else c
+
     def users(self):
-        self.z.ReadAllUserID(1); out = []
+        self.z.ReadAllUserID(1); out, self.card_err = [], ''
         while True:
             r = self.z.SSR_GetAllUserInfo(1)                    # (ok, id, name, password, privilege, enabled)
             if not r[0]: break
-            card = ''
+            out.append({'id': str(r[1]), 'name': r[2], 'pw': r[3], 'priv': r[4], 'en': r[5], 'card': self._card_now()})
+        now = time.time()                                       # second way to read the card: read the single user again, then ask for the card
+        todo = [u for u in out if not u['card'] and now - CARD_SEEN.get((self.ip, u['id']), 0) > 21600]
+        hit = False
+        for k, u in enumerate(todo):
+            if k >= 10 and not hit: break                       # the second way gives nothing on this machine: stop trying (it is tried again in 6 hours)
             try:
-                c = self.z.GetStrCardNumber()                   # RFID card of the user just read: (ok, card)
-                card = str(c[1]) if isinstance(c, tuple) and c[0] else ''
-            except Exception: pass
-            out.append({'id': str(r[1]), 'name': r[2], 'pw': r[3], 'priv': r[4], 'en': r[5], 'card': card})
+                if self.z.SSR_GetUserInfo(1, u['id'])[0]: u['card'] = self._card_now()
+            except Exception as e: self.card_err = self.card_err or repr(e)
+            hit = hit or bool(u['card'])
+        for u in todo: CARD_SEEN[(self.ip, u['id'])] = now
+        n = sum(1 for u in out if u['card'])
+        if CARD_LOGGED.get(self.ip) != n:
+            CARD_LOGGED[self.ip] = n
+            log(f'{self.ip}: RFID cards read from the machine: {n} of {len(out)} users' + (f'  (card read error: {self.card_err})' if self.card_err and not n else ''))
         return out
 
     def templates(self, uid):
@@ -1137,7 +1182,7 @@ def sync_target(name, ip, cfg, users, tmpl, removed=frozenset(), leavers=frozens
                     except Exception as e: bad.add(u['id']); log(f'{name} {ip}: face of ID {u["id"]} failed ({e})')
                 if new and u['id'] not in bad:
                     r['added'] += 1
-                    ev('TRANSFER', u['id'], u['name'], name, 'copied: ' + ', '.join(b for b in (f'{len(t["fp"])} fingerprint(s)' if t['fp'] else '', 'face' if t['face'] else '', 'RFID card' if u.get('card') else '') if b))
+                    ev('TRANSFER', u['id'], u['name'], name, 'copied: ' + ', '.join(b for b in (f'{len(t["fp"])} fingerprint(s)' if t['fp'] else '', 'face' if t['face'] else '', 'RFID card ' + str(u['card']) if u.get('card') else '') if b))
             gone = set()
             for uid in removed:                                           # deleted on the Enroller (mirror mode) -> delete here
                 if uid in have:
@@ -1279,7 +1324,7 @@ def restore_to(name, ip, people, overwrite):
                     for fid, data in p['fp']: d.set_fp(p['id'], fid, data)
                     if p['face']: d.set_face(p['id'], p['face'])
                     r['done'] += 1
-                    ev('RESTORE', p['id'], p['name'], name, 'restored from backup: ' + (', '.join(b for b in (f'{len(p["fp"])} fingerprint(s)' if p['fp'] else '', 'face' if p['face'] else '', 'RFID card' if p['card'] else '') if b) or 'user data only'))
+                    ev('RESTORE', p['id'], p['name'], name, 'restored from backup: ' + (', '.join(b for b in (f'{len(p["fp"])} fingerprint(s)' if p['fp'] else '', 'face' if p['face'] else '', 'RFID card ' + str(p['card']) if p['card'] else '') if b) or 'user data only'))
                 except Exception as e:
                     r['failed'] += 1; log(f'{name} {ip}: restore of ID {p["id"]} failed ({e})')
             d.refresh()
@@ -1464,7 +1509,7 @@ def _walk(w):
 
 
 def apply_lock():
-    try: free = {str(rf), str(rt)}                                                               # the report date filters only choose what to look at
+    try: free = {str(rf), str(rt), str(qs)}                                                               # the report date filters only choose what to look at
     except NameError: free = set()
     st = ['!disabled'] if EDIT['on'] else ['disabled']
     for w in _walk(root):
@@ -1811,6 +1856,81 @@ bb = tk.Frame(b1, bg='white'); bb.pack(fill='x', pady=(8, 0))
 ttk.Button(bb, text='Backup now (scan all machines)', style='Primary.TButton', command=lambda: sync_now(False, True)).pack(side='left')
 ttk.Button(bb, text='Download backup (zip)', command=dl_zip).pack(side='left', padx=8); ttk.Button(bb, text='Download backup list (Excel)', command=dl_xlsx).pack(side='left')
 ttk.Button(bb, text='Restore from backup', command=open_restore).pack(side='left', padx=8)
+
+# ---- search the backup: find an employee, filter by the kind of data, transfer to a machine
+s1o, s1 = make_card(br, 'Search the backup  (find an employee, filter by data, transfer to a machine)'); s1o.pack(fill='x', padx=12, pady=6)
+qs, qf, qinfo, qtr, qow, qto = tk.StringVar(), tk.StringVar(value=BK_FILTERS[0]), tk.StringVar(), tk.StringVar(), tk.BooleanVar(value=False), tk.StringVar()
+sb = tk.Frame(s1, bg='white'); sb.pack(fill='x')
+lbl(sb, 'Search').pack(side='left'); se = ttk.Entry(sb, textvariable=qs, width=24); se.pack(side='left', padx=(6, 14))
+lbl(sb, 'Filter').pack(side='left'); ttk.Combobox(sb, textvariable=qf, values=BK_FILTERS, width=20, state='readonly').pack(side='left', padx=(6, 14))
+
+
+def show_backup(_e=None):
+    try: rows = query_backup(qs.get(), qf.get())
+    except Exception as e: qinfo.set(f'backup database: {e}'); return
+    bk.delete(*bk.get_children())
+    for r in rows[:3000]: bk.insert('', 'end', iid=str(r[0]), values=r)
+    qinfo.set(f'{len(rows)} employees' + ('  (first 3000 shown - the Excel file has all)' if len(rows) > 3000 else ''))
+
+
+def clear_backup():
+    qs.set(''); qf.set(BK_FILTERS[0]); show_backup()
+
+
+def dl_filtered():
+    p = save_as('Save list', f'Backup_search_{date.today():%Y-%m-%d}.xlsx', '.xlsx')
+    if p:
+        try: export_backup_xlsx(p, qs.get(), qf.get()); log(f'Backup list saved: {p}')
+        except Exception as e: messagebox.showerror('Backup', str(e))
+
+
+def transfer_choices():
+    on = [(r['name'].get().strip() or 'Machine', r['ip'].get().strip()) for r in mrows if r['on'].get() and r['ip'].get().strip()]
+    ch = {f'All ticked machines ({len(on)})': on} if on else {}
+    if enr.get().strip(): ch[f'Enroller ({enr.get().strip()}) - goes on to every machine'] = [('Enroller', enr.get().strip())]
+    for r in mrows:
+        if r['ip'].get().strip(): ch[f'{r["name"].get().strip() or "Machine"} ({r["ip"].get().strip()})'] = [(r['name'].get().strip() or 'Machine', r['ip'].get().strip())]
+    return ch
+
+
+def transfer_selected():
+    ids, tg = list(bk.selection()), transfer_choices().get(qto.get())
+    if not ids: messagebox.showinfo('Transfer', 'Select one or more employees in the list first (Ctrl / Shift for several).'); return
+    if not tg: messagebox.showinfo('Transfer', 'Choose the machine to transfer to.'); return
+    if not ask_password('Transfer from backup'): return
+    if not busy.acquire(blocking=False): messagebox.showinfo('Transfer', 'A sync is running - try again in a minute.'); return
+    qtr.set('Transferring ... please wait (progress is in the log under the tabs)'); over, out = qow.get(), []
+
+    def work():
+        try:
+            want = {norm(x) for x in ids}; ppl = [p for p in backup_people() if norm(p['id']) in want]
+            out.append('\n'.join(run_restore(ppl, tg, over, 'the search list') if ppl else ['Nothing to transfer: the selected employees are deleted or have a service end date before today.']))
+        except Exception as e:
+            out.append(f'FAILED: {e}'); log(f'Transfer FAILED: {e}')
+        finally: busy.release()
+
+    def wait():
+        if not out: root.after(500, wait); return
+        qtr.set(out[0])
+
+    threading.Thread(target=work, daemon=True).start(); wait()
+
+
+ttk.Button(sb, text='Search', style='Primary.TButton', command=show_backup).pack(side='left'); ttk.Button(sb, text='Clear', command=clear_backup).pack(side='left', padx=6)
+ttk.Button(sb, text='Download this list (Excel)', command=dl_filtered).pack(side='left', padx=6); tk.Label(sb, textvariable=qinfo, bg='white', fg=MUTED, font=('Segoe UI', 9)).pack(side='left', padx=8)
+se.bind('<Return>', show_backup)
+note(s1, 'Search: employee ID (several IDs separated by a comma), part of a name, or an RFID card number.  Filter: choose which data you want to see, e.g. only the employees that have a face, or only RFID card.').pack(anchor='w', pady=(4, 4))
+bw = tk.Frame(s1, bg='white'); bw.pack(fill='x')
+bcols = (('id', 'Employee ID', 100), ('name', 'Name', 200), ('card', 'RFID card', 130), ('fp', 'Fingerprints', 90), ('face', 'Face', 60), ('status', 'Status', 80), ('upd', 'Last updated', 150))
+bk = ttk.Treeview(bw, columns=[c[0] for c in bcols], show='headings', height=7, selectmode='extended')
+for k, t, w in bcols: bk.heading(k, text=t); bk.column(k, width=w, anchor='w')
+bsc = ttk.Scrollbar(bw, orient='vertical', command=bk.yview); bk.configure(yscrollcommand=bsc.set); bk.pack(side='left', fill='x', expand=True); bsc.pack(side='right', fill='y')
+trb = tk.Frame(s1, bg='white'); trb.pack(fill='x', pady=(8, 0))
+lbl(trb, 'Transfer the selected employees to', fg=INK).pack(side='left'); ttk.Combobox(trb, textvariable=qto, width=44, state='readonly', postcommand=lambda: qto_cb.config(values=list(transfer_choices()))).pack(side='left', padx=8)
+qto_cb = trb.winfo_children()[-1]
+tk.Checkbutton(trb, text='Overwrite if already on the machine', variable=qow, bg='white', activebackground='white', fg=MUTED, font=FN, bd=0, highlightthickness=0).pack(side='left', padx=8)
+ttk.Button(trb, text='Select all', command=lambda: bk.selection_set(bk.get_children())).pack(side='left', padx=(4, 0)); ttk.Button(trb, text='Transfer selected', style='Primary.TButton', command=transfer_selected).pack(side='left', padx=8)
+tk.Label(s1, textvariable=qtr, bg='white', fg=INK, font=FN, justify='left', wraplength=980).pack(anchor='w', pady=(4, 0))
 
 r1o, r1c = make_card(br, 'Activity and deletion reports'); r1o.pack(fill='both', expand=True, padx=12, pady=(6, 10))
 rf, rt, rtype, rinfo = tk.StringVar(value=f'{date.today():%d-%m-%Y}'), tk.StringVar(value=f'{date.today():%d-%m-%Y}'), tk.StringVar(value='All'), tk.StringVar()
