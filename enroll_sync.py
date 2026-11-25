@@ -109,6 +109,8 @@ def db():
     c = sqlite3.connect(db_path(), timeout=30)
     c.execute('CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT, priv INTEGER, pw TEXT, card TEXT, fp TEXT, face TEXT, first_seen TEXT, updated TEXT, source TEXT, status TEXT, deleted_on TEXT, reason TEXT)')
     c.execute('CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, day TEXT, kind TEXT, uid TEXT, name TEXT, machine TEXT, detail TEXT)')
+    c.execute('CREATE TABLE IF NOT EXISTS punches (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, day TEXT, uid TEXT, name TEXT, machine TEXT, ip TEXT, mode TEXT, inout INTEGER)')
+    c.execute('CREATE UNIQUE INDEX IF NOT EXISTS ux_punch ON punches (ip, uid, ts)')
     return c
 
 
@@ -187,6 +189,51 @@ def query_events(d1, d2, kinds=None):
         return c.execute(sql + ' ORDER BY ts', args).fetchall()
     finally:
         c.close()
+
+
+VERIFY_NAME = {0: 'PW', 1: 'FP', 2: 'RF', 3: 'PW', 4: 'RF', 15: 'FACE'}     # verify mode of a punch as the machine reports it: RF = RFID card
+
+
+def save_punches(rows):
+    """rows: (time, day, ID, name, machine, ip, verify mode, in/out). A punch that is already stored is ignored -> number of NEW punches."""
+    c = db()
+    try:
+        n0 = c.total_changes
+        c.executemany('INSERT OR IGNORE INTO punches (ts, day, uid, name, machine, ip, mode, inout) VALUES (?,?,?,?,?,?,?,?)', rows); c.commit()
+        return c.total_changes - n0
+    finally: c.close()
+
+
+def query_punches(d1=None, d2=None, machine='', search='', after_id=0):
+    """-> [(row id, time, ID, name, machine, verify mode)] oldest first. `search`: IDs (exact, several separated by comma / space) or part of a name."""
+    sql, args = 'SELECT id, ts, uid, name, machine, mode FROM punches WHERE id > ?', [int(after_id)]
+    if d1: sql += ' AND day >= ?'; args.append(d1.isoformat())
+    if d2: sql += ' AND day <= ?'; args.append(d2.isoformat())
+    if machine: sql += ' AND machine = ?'; args.append(machine)
+    c = db()
+    try: rows = c.execute(sql + ' ORDER BY ts, id', args).fetchall()
+    finally: c.close()
+    terms = [t.lower() for t in re.split(r'[;,\s]+', search.strip()) if t]
+    if terms: rows = [r for r in rows if any(norm(t) == norm(r[2]) or t in (r[3] or '').lower() for t in terms)]
+    return rows
+
+
+def export_punches(path, rows):
+    """Excel like the attendance software: Ac-No, Name, Time, Machine, Verify Mode (a new sheet after 900 000 rows)."""
+    import openpyxl
+    from openpyxl.cell import WriteOnlyCell
+    wb = openpyxl.Workbook(write_only=True); ws = None
+    def new_sheet(k):
+        w = wb.create_sheet('Punch logs' if k == 0 else f'Punch logs {k + 1}')
+        for col, wd in zip('ABCDE', (14, 24, 22, 16, 14)): w.column_dimensions[col].width = wd
+        w.append(['Ac-No', 'Name', 'Time', 'Machine', 'Verify Mode']); return w
+    ws = new_sheet(0)
+    for i, (_id, ts, uid, name, mach, mode) in enumerate(rows):
+        if i and i % 900000 == 0: ws = new_sheet(i // 900000)
+        try: cell = WriteOnlyCell(ws, value=datetime.strptime(ts, '%Y-%m-%d %H:%M:%S')); cell.number_format = 'dd/mm/yyyy hh:mm:ss'
+        except ValueError: cell = ts
+        ws.append([uid, name or uid, cell, mach, mode])
+    wb.save(path); return len(rows)
 
 
 def export_report(path, d1, d2, kinds=None):
@@ -304,7 +351,17 @@ def daily_mail():
     atts = [(os.path.basename(rep), open(rep, 'rb').read())]
     if size <= 20 * 1024 * 1024: atts.append((os.path.basename(zp), open(zp, 'rb').read()))
     else: body += f'\nThe backup file is {size // 1048576} MB - too big to attach. It is in the backup folder: {os.path.dirname(db_path())}\n'
+    pr = query_punches(after_id=int(cfg.get('mail_log_id') or 0))                  # every punch that was not e-mailed yet
+    if pr:
+        pp = os.path.join(tmp, f'Punch_Logs_{day:%Y-%m-%d}.xlsx'); export_punches(pp, pr)
+        body += f'\nPunch logs in the attached Excel file: {len(pr)} punches ({pr[0][1]} to {pr[-1][1]}).\n'
+        if os.path.getsize(pp) <= 20 * 1024 * 1024: atts.append((os.path.basename(pp), open(pp, 'rb').read()))
+        else:
+            keep = os.path.join(os.path.dirname(db_path()), os.path.basename(pp)); shutil.copy(pp, keep)
+            body += f'The punch log file is too big to attach. It is in the backup folder: {keep}\n'
+    else: body += '\nNo new punch logs since the last e-mail.\n'
     send_mail(f'Enroll Sync daily report {day:%d %b %Y}', body, atts)
+    if pr: cfg['mail_log_id'] = max(r[0] for r in pr); save_json(CFG_FILE, cfg)      # only after the e-mail really went out
     return n
 
 
@@ -1121,6 +1178,34 @@ class Dev:
             except Exception as e: bits.append(f'ID {u["id"]}: {e!r}')
         return ' | '.join(bits)
 
+    def counts(self):
+        """The numbers the machine shows itself: registered users, fingerprint templates, face templates, attendance records."""
+        out = {}
+        for k, code in (('users', 2), ('fp', 3), ('face', 21), ('logs', 6)):
+            try:
+                r = self.z.GetDeviceStatus(1, code)                  # (ok, value) - the flag is not reliable on these machines, the value is
+                v = int(r[-1] if isinstance(r, tuple) else r); out[k] = v if (v > 0 or not isinstance(r, tuple) or r[0]) else None
+            except Exception: out[k] = None
+        return out
+
+    def logs(self):
+        """Every attendance record on the machine -> [(ID, 'YYYY-MM-DD HH:MM:SS', verify mode, in/out)]. Nothing is deleted from the machine."""
+        self.z.ReadGeneralLogData(1)
+        fn = r = None
+        for name, args in (('SSR_GetGeneralLogData', (1,)), ('SSR_GetGeneralLogData', (1, 0)), ('GetGeneralLogData', (1,))):
+            try: r = getattr(self.z, name)(*args); fn = (name, args); break
+            except Exception as e: self.card_err = self.card_err or f'{name}: {e!r}'
+        if fn is None: raise RuntimeError('cannot read the attendance records (' + self.card_err + ')')
+        out = []
+        while r[0]:
+            v = r[1:]
+            if fn[0] == 'GetGeneralLogData': uid, vm, io, t = str(v[1]), v[3], v[4], v[5:11]     # (machine, ID, machine, verify, in/out, y, m, d, h, mi, s)
+            else: uid, vm, io, t = str(v[0]), v[1], v[2], v[3:9]                                 # (ID, verify, in/out, y, m, d, h, mi, s, workcode)
+            try: out.append((uid, datetime(*[int(x) for x in t]).strftime('%Y-%m-%d %H:%M:%S'), int(vm), int(io)))
+            except (ValueError, TypeError): pass
+            r = getattr(self.z, fn[0])(*fn[1])
+        return out
+
     def templates(self, uid):
         """-> {'fp': [(finger index, data)], 'face': (data, length) or None}"""
         fp = []
@@ -1149,6 +1234,7 @@ class Dev:
 
 
 # ---------------------------------------------------------------- machine connectivity (shown next to every machine)
+MINFO = {}                                         # ip -> {'users', 'fp', 'face', 'logs', 'time'}  as the machine itself reports them
 MSTAT, WATCH = {}, []                              # ip -> {'online', 'last'};  WATCH = IPs to check (kept up to date by the window)
 
 
@@ -1179,7 +1265,7 @@ def backup_scan(d, name, users, full):
     return new
 
 
-def sync_target(name, ip, cfg, users, tmpl, removed=frozenset(), leavers=frozenset(), allow_bulk=False, push_all=False, full_scan=False):
+def sync_target(name, ip, cfg, users, tmpl, removed=frozenset(), leavers=frozenset(), allow_bulk=False, push_all=False, full_scan=False, manual=frozenset()):
     """Copy the Enroller users to this machine (new ones; everybody when push_all), delete `removed` and the leavers, then back the machine up.
     Returns a dict: added, fingers, faces, deleted, left, ok (IDs that are now on the machine with all their templates), scanned."""
     d = Dev(ip, cfg['port'], cfg['comm_key'])
@@ -1208,6 +1294,11 @@ def sync_target(name, ip, cfg, users, tmpl, removed=frozenset(), leavers=frozens
             for uid in removed:                                           # deleted on the Enroller (mirror mode) -> delete here
                 if uid in have:
                     d.delete(uid); gone.add(uid); r['deleted'] += 1; ev('DELETE', uid, names.get(uid), name, 'deleted on the Enroller (mirror)')
+            for u in [x for x in dst if norm(x['id']) in manual and x['id'] not in gone]:           # deleted with the delete box while this machine was not reachable
+                if u['id'] not in backup_ids():
+                    try: save_backup(u, d.templates(u['id']), name)
+                    except Exception as e: log(f'{name}: backup of ID {u["id"]} failed ({e})')
+                d.delete(u['id']); gone.add(u['id']); r['deleted'] += 1; ev('DELETE', u['id'], u['name'], name, 'deleted by the delete box (the machine was offline)'); mark_deleted(u['id'], 'deleted by hand')
             lv = [u for u in dst if norm(u['id']) in leavers and u['id'] not in gone]
             if lv and len(lv) > BULK_LIMIT and not allow_bulk:
                 log(f'{name} {ip}: {len(lv)} leavers NOT deleted (more than {BULK_LIMIT} at once). Tick "Allow bulk delete" if this is correct.')
@@ -1227,6 +1318,12 @@ def sync_target(name, ip, cfg, users, tmpl, removed=frozenset(), leavers=frozens
             except Exception: pass
         try: r['scanned'] = backup_scan(d, name, dst, full_scan)           # backup of what is already on the machine
         except Exception as e: log(f'{name}: backup scan failed ({e})')
+        try:                                                                         # every punch of the machine goes into the database
+            recs = d.logs(); new = save_punches([(ts, ts[:10], uid, names.get(uid) or uid, name, ip, VERIFY_NAME.get(vm, f'Mode {vm}'), io) for uid, ts, vm, io in recs]) if recs else 0
+            if new: log(f'{name} {ip}: +{new} punch logs')
+        except Exception as e: log(f'{name}: punch logs failed ({e})')
+        try: MINFO[ip] = dict(d.counts(), time=time.time())
+        except Exception: pass
         return r
     finally:
         d.close()
@@ -1241,10 +1338,24 @@ def run_cycle(cfg, targets, allow_bulk, force=False, leavers=frozenset(), full_s
         log(f'Enroller {cfg["enroller"]}: cannot connect ({e}). Nothing changed.'); return False
     try:
         users = src.users()
+        try: MINFO[cfg['enroller']] = dict(src.counts(), time=time.time())
+        except Exception: pass
+        pend = pending_load(); pend_all = {norm(x) for v in pend.values() for x in v}
+        epend = {norm(x) for x in pend.get(cfg['enroller'], [])}
+        if epend and any(norm(u['id']) in epend for u in users):                  # deleted with the delete box while the Enroller was not reachable
+            try:
+                src.disable()
+                for u in [x for x in users if norm(x['id']) in epend]:
+                    if u['id'] not in backup_ids(): save_backup(u, src.templates(u['id']), f'Enroller {cfg["enroller"]}')
+                    src.delete(u['id']); ev('DELETE', u['id'], u['name'], 'Enroller', 'deleted by the delete box (the Enroller was offline)'); mark_deleted(u['id'], 'deleted by hand')
+                src.refresh(); src.enable()
+                users = [u for u in users if norm(u['id']) not in epend]
+            except Exception as e: log(f'Enroller: pending deletion FAILED ({e})')
+        if epend: pending_clear(cfg['enroller'], pend.get(cfg['enroller'], []))
         if not users and not purge:
             log('Enroller returned 0 users - stopped, nothing changed (protection against wiping the other machines).'); return False
         ids = {u['id'] for u in users}
-        copy = [u for u in users if norm(u['id']) not in leavers]         # leavers are never copied to the other machines
+        copy = [u for u in users if norm(u['id']) not in leavers and norm(u['id']) not in pend_all]         # leavers and employees deleted by hand are never copied to the other machines
         cache = {}
         def tmpl(uid):                                                    # templates are read from the Enroller once per cycle
             if uid not in cache: cache[uid] = src.templates(uid)
@@ -1262,7 +1373,8 @@ def run_cycle(cfg, targets, allow_bulk, force=False, leavers=frozenset(), full_s
                     log(f'{name} {ip}: {len(removed)} deletions skipped (more than {BULK_LIMIT}). Tick "Allow bulk delete" if this is intended.')
                     removed, keep = set(), prev
             try:
-                r = sync_target(name, ip, cfg, copy, tmpl, removed, leavers, allow_bulk, purge or force, full_scan and not did_full)
+                r = sync_target(name, ip, cfg, copy, tmpl, removed, leavers, allow_bulk, purge or force, full_scan and not did_full, manual=frozenset(norm(x) for x in pend.get(ip, [])))
+                if pend.get(ip): pending_clear(ip, pend[ip])
                 did_full = did_full or full_scan
                 results[name] = r
                 if not purge:
@@ -1304,6 +1416,53 @@ def run_cycle(cfg, targets, allow_bulk, force=False, leavers=frozenset(), full_s
     finally:
         src.close(); flush_events()
     return did_full
+
+
+# ---------------------------------------------------------------- delete an employee from every machine at once
+PENDING_FILE = os.path.join(APP, 'pending_delete.json')            # ip -> IDs that still have to be deleted there (the machine was offline)
+
+
+def pending_load(): return load_json(PENDING_FILE, {})
+
+
+def pending_add(ip, ids):
+    p = pending_load(); p[ip] = sorted(set(p.get(ip, [])) | {str(i) for i in ids}); save_json(PENDING_FILE, p)
+
+
+def pending_clear(ip, ids):
+    p = pending_load(); left = sorted(set(p.get(ip, [])) - {str(i) for i in ids})
+    if left: p[ip] = left
+    else: p.pop(ip, None)
+    save_json(PENDING_FILE, p)
+
+
+def delete_now(ids, tg):
+    """Delete these employee IDs (user, fingerprints, face, card) from every machine in tg = [(name, ip)] right now. A copy stays in the backup.
+    A machine that cannot be reached is remembered and the sync deletes there as soon as it is back. -> list of text lines."""
+    want, lines = {norm(i) for i in ids}, []
+    for name, ip in tg:
+        try: d = Dev(ip, cfg['port'], cfg['comm_key'])
+        except Exception as e:
+            pending_add(ip, ids); lines.append(f'{name} {ip}: NOT reachable ({e}) - will be deleted there as soon as it is reachable'); continue
+        try:
+            hit = 0
+            try:
+                d.disable()
+                for u in [x for x in d.users() if norm(x['id']) in want]:
+                    if u['id'] not in backup_ids():
+                        try: save_backup(u, d.templates(u['id']), name)
+                        except Exception as e: log(f'{name}: backup of ID {u["id"]} failed ({e})')
+                    d.delete(u['id']); hit += 1; ev('DELETE', u['id'], u['name'], name, 'deleted now (delete box)'); mark_deleted(u['id'], 'deleted by hand')
+                if hit: d.refresh()
+            finally:
+                try: d.enable()
+                except Exception: pass
+            pending_clear(ip, ids); lines.append(f'{name} {ip}: ' + (f'deleted ({hit})' if hit else 'was not on this machine'))
+        except Exception as e:
+            pending_add(ip, ids); lines.append(f'{name} {ip}: FAILED ({e}) - the sync will try again')
+        finally: d.close()
+    flush_events()
+    return lines
 
 
 # ---------------------------------------------------------------- restore: put enrollments from the backup back on the machines
@@ -1530,7 +1689,7 @@ def _walk(w):
 
 
 def apply_lock():
-    try: free = {str(rf), str(rt), str(qs)}                                                               # the report date filters only choose what to look at
+    try: free = {str(rf), str(rt), str(qs), str(pg_from), str(pg_to), str(pg_id), str(del_ids)}                                                               # the report date filters only choose what to look at
     except NameError: free = set()
     st = ['!disabled'] if EDIT['on'] else ['disabled']
     for w in _walk(root):
@@ -1643,10 +1802,11 @@ r1 = tk.Frame(c1, bg='white'); r1.pack(fill='x')
 lbl(r1, 'Enroller Machine IP', fg=INK, font=FB).pack(side='left'); ttk.Entry(r1, textvariable=enr, width=18, font=('Segoe UI', 11)).pack(side='left', padx=10)
 enr_st = lbl(r1, '-', width=16, anchor='w'); enr_st.pack(side='left'); enr_last = lbl(r1, '', font=('Segoe UI', 9)); enr_last.pack(side='left')
 note(c1, 'New enrollments are done on this machine. They are copied to the machines below and then removed from it (see Options).').pack(anchor='w', pady=(6, 0))
+enr_info = lbl(c1, '', font=('Segoe UI', 9)); enr_info.pack(anchor='w', pady=(4, 0))
 
 c2o, c2 = make_card(bc, 'Machines  (IN / OUT / Colony gates)'); c2o.pack(fill='x', padx=12, pady=6)
 minner = tk.Frame(c2, bg='white'); minner.pack(fill='x')
-for c, t in enumerate(('Use', 'Machine name', 'IP address', 'Connectivity', 'Last sync', '')): lbl(minner, t, font=('Segoe UI', 9, 'bold')).grid(row=0, column=c, sticky='w', padx=(0, 8), pady=(0, 4))
+for c, t in enumerate(('Use', 'Machine name', 'IP address', 'Connectivity', 'UserCount', 'Fp Count', 'Fc Count', 'Log Count', 'Last sync', '')): lbl(minner, t, font=('Segoe UI', 9, 'bold')).grid(row=0, column=c, sticky='w', padx=(0, 8), pady=(0, 4))
 mrows = []
 
 
@@ -1658,9 +1818,9 @@ def regrid():
 def add_row(m=None):
     m = m or {'name': f'Machine {len(mrows) + 1}', 'ip': '', 'on': True}
     r = {'on': tk.BooleanVar(value=bool(m.get('on', True))), 'name': tk.StringVar(value=m.get('name', '')), 'ip': tk.StringVar(value=m.get('ip', ''))}
-    r['st'] = lbl(minner, '-', width=14, anchor='w'); r['last'] = lbl(minner, '', font=('Segoe UI', 9), width=48, anchor='w')
-    r['w'] = [ttk.Checkbutton(minner, variable=r['on'], style='Card.TCheckbutton'), ttk.Entry(minner, textvariable=r['name'], width=20), ttk.Entry(minner, textvariable=r['ip'], width=16),
-              r['st'], r['last'], ttk.Button(minner, text='\u2715', width=3, style='Ghost.TButton', command=lambda r=r: remove_row(r))]
+    r['st'] = lbl(minner, '-', width=14, anchor='w'); r['last'] = lbl(minner, '', font=('Segoe UI', 9), width=30, anchor='w'); r['cnt'] = [lbl(minner, '-', width=9, anchor='center', fg=INK) for _ in range(4)]
+    r['w'] = [ttk.Checkbutton(minner, variable=r['on'], style='Card.TCheckbutton'), ttk.Entry(minner, textvariable=r['name'], width=16), ttk.Entry(minner, textvariable=r['ip'], width=16),
+              r['st'], *r['cnt'], r['last'], ttk.Button(minner, text='\u2715', width=3, style='Ghost.TButton', command=lambda r=r: remove_row(r))]
     mrows.append(r); regrid(); apply_lock()
 
 
@@ -1671,7 +1831,7 @@ def remove_row(r):
 
 for _m in cfg['machines']: add_row(_m)
 mb = tk.Frame(c2, bg='white'); mb.pack(fill='x', pady=(8, 0))
-ttk.Button(mb, text='+ Add machine', command=lambda: add_row()).pack(side='left')
+ttk.Button(mb, text='+ Add machine', command=lambda: add_row()).pack(side='left'); ttk.Button(mb, text='Refresh counts', command=lambda: refresh_counts()).pack(side='left', padx=(8, 0))
 note(mb, 'Tick = this machine receives the enrollments.  \u2715 = remove the machine from the list.', wrap=700).pack(side='left', padx=14)
 
 c3o, c3 = make_card(bc, 'Options'); c3o.pack(fill='x', padx=12, pady=6)
@@ -1681,10 +1841,62 @@ lbl(r3, 'Comm Key').pack(side='left'); ttk.Entry(r3, textvariable=comm, width=8,
 ttk.Checkbutton(c3, text='Delete from the Enroller after the enrollment is on every machine and saved in the backup', variable=purge_v, style='Card.TCheckbutton').pack(anchor='w', pady=(8, 2))
 ttk.Checkbutton(c3, text='Allow bulk delete (more than 20 leavers / deletions at once)', variable=bulk_v, style='Card.TCheckbutton').pack(anchor='w', pady=2)
 
+# ---- delete an employee from all machines at once
+x1o, x1 = make_card(bc, 'Delete an employee from all machines now'); x1o.pack(fill='x', padx=12, pady=6)
+del_ids, del_enr, del_res = tk.StringVar(), tk.BooleanVar(value=True), tk.StringVar()
+rdl = tk.Frame(x1, bg='white'); rdl.pack(fill='x')
+lbl(rdl, 'Employee ID', fg=INK, font=FB).pack(side='left'); ttk.Entry(rdl, textvariable=del_ids, width=30, font=('Segoe UI', 11)).pack(side='left', padx=10)
+ttk.Button(rdl, text='Delete from all machines', style='Primary.TButton', command=lambda: delete_box()).pack(side='left')
+tk.Checkbutton(x1, text='Also delete from the Enroller machine', variable=del_enr, bg='white', activebackground='white', fg=MUTED, font=FN, bd=0, highlightthickness=0).pack(anchor='w', pady=(6, 0))
+note(x1, 'Type one employee ID (or several, separated by a comma). The user with fingerprints, face and card is deleted from every machine in the list at once. '
+         'A copy stays in the backup. A machine that is offline is remembered and the sync deletes there as soon as it is back.').pack(anchor='w', pady=(4, 0))
+tk.Label(x1, textvariable=del_res, bg='white', fg=INK, font=FN, justify='left', wraplength=980).pack(anchor='w', pady=(4, 0))
+
 busy, auto_t = threading.Lock(), [None]
 
 
 def targets(): return [(m['name'], m['ip']) for m in cfg['machines'] if m['on'] and m['ip']]
+
+
+def refresh_counts():
+    """Ask every machine for UserCount / Fp Count / Fc Count / Log Count now."""
+    if not busy.acquire(blocking=False): messagebox.showinfo('Machines', 'A sync is running - the numbers are updated at the end of every sync.'); return
+
+    def work():
+        try:
+            for m in [x for x in cfg['machines'] if x['ip']]:
+                try:
+                    d = Dev(m['ip'], cfg['port'], cfg['comm_key'])
+                    try: MINFO[m['ip']] = dict(d.counts(), time=time.time())
+                    finally: d.close()
+                except Exception as e: log(f'{m["name"]} {m["ip"]}: counts failed ({e})')
+        finally: busy.release()
+    threading.Thread(target=work, daemon=True).start()
+
+
+def delete_box():
+    ids = [x for x in re.split(r'[;,\s]+', del_ids.get().strip()) if x]
+    if not ids: messagebox.showinfo('Delete', 'Type the employee ID first (several IDs: separate them with a comma).'); return
+    tg = [(r['name'].get().strip() or 'Machine', r['ip'].get().strip()) for r in mrows if r['ip'].get().strip()]
+    if del_enr.get() and enr.get().strip(): tg.append(('Enroller', enr.get().strip()))
+    if not tg: messagebox.showinfo('Delete', 'No machine is entered.'); return
+    if not messagebox.askyesno('Delete from all machines', 'Delete ID ' + ', '.join(ids) + ' (user, fingerprints, face, card) from ' + str(len(tg)) + ' machine(s) NOW?\n\nA copy stays in the backup.', icon='warning'): return
+    if not ask_password('Delete from all machines'): return
+    del_res.set('Deleting ... (if a sync is running right now, the deletion starts as soon as it is finished)'); out = []
+
+    def work():
+        got = busy.acquire(timeout=900)
+        try: out.append('\n'.join(delete_now(ids, tg)) if got else 'FAILED: a sync is still running - try again.')
+        except Exception as e:
+            out.append(f'FAILED: {e}'); log(f'Delete box FAILED: {e}')
+        finally:
+            if got: busy.release()
+
+    def wait():
+        if not out: root.after(500, wait); return
+        del_res.set(out[0]); log('Delete box: ' + out[0].replace('\n', ' | ')); del_ids.set('')
+
+    threading.Thread(target=work, daemon=True).start(); wait()
 
 
 def save():
@@ -1953,6 +2165,49 @@ tk.Checkbutton(trb, text='Overwrite if already on the machine', variable=qow, bg
 ttk.Button(trb, text='Select all', command=lambda: bk.selection_set(bk.get_children())).pack(side='left', padx=(4, 0)); ttk.Button(trb, text='Transfer selected', style='Primary.TButton', command=transfer_selected).pack(side='left', padx=8)
 tk.Label(s1, textvariable=qtr, bg='white', fg=INK, font=FN, justify='left', wraplength=980).pack(anchor='w', pady=(4, 0))
 
+# ---- attendance punch logs: every punch of every machine
+p1o, p1 = make_card(br, 'Attendance punch logs  (every punch of every machine - also sent by e-mail as an Excel file)'); p1o.pack(fill='x', padx=12, pady=6)
+pg_from, pg_to, pg_mach, pg_id, pg_info = tk.StringVar(value=f'{date.today():%d-%m-%Y}'), tk.StringVar(value=f'{date.today():%d-%m-%Y}'), tk.StringVar(value='All machines'), tk.StringVar(), tk.StringVar()
+pgb = tk.Frame(p1, bg='white'); pgb.pack(fill='x')
+lbl(pgb, 'From').pack(side='left'); ttk.Entry(pgb, textvariable=pg_from, width=12, justify='center').pack(side='left', padx=(6, 12))
+lbl(pgb, 'To').pack(side='left'); ttk.Entry(pgb, textvariable=pg_to, width=12, justify='center').pack(side='left', padx=(6, 12))
+lbl(pgb, 'Machine').pack(side='left'); pg_cb = ttk.Combobox(pgb, textvariable=pg_mach, width=16, state='readonly', postcommand=lambda: pg_cb.config(values=['All machines'] + [r['name'].get().strip() for r in mrows if r['name'].get().strip()]))
+pg_cb.pack(side='left', padx=(6, 12))
+lbl(pgb, 'Employee ID').pack(side='left'); ttk.Entry(pgb, textvariable=pg_id, width=14).pack(side='left', padx=(6, 12))
+
+
+def pg_rows():
+    try: d1_, d2_ = parse_day(pg_from.get()), parse_day(pg_to.get())
+    except ValueError as e: messagebox.showerror('Date', str(e)); return None
+    try: return query_punches(d1_, d2_, '' if pg_mach.get() == 'All machines' else pg_mach.get(), pg_id.get())
+    except Exception as e: messagebox.showerror('Punch logs', str(e)); return None
+
+
+def show_punches():
+    rows = pg_rows()
+    if rows is None: return
+    pg_tree.delete(*pg_tree.get_children())
+    for r in rows[::-1][:2000]: pg_tree.insert('', 'end', values=(r[2], r[3] or r[2], r[1], r[4], r[5]))
+    pg_info.set(f'{len(rows)} punches' + ('  (newest 2000 shown - the Excel file has all)' if len(rows) > 2000 else ''))
+
+
+def dl_punches():
+    rows = pg_rows()
+    if rows is None: return
+    p = save_as('Save punch logs', f'Punch_Logs_{date.today():%Y-%m-%d}.xlsx', '.xlsx')
+    if p:
+        try: log(f'Punch logs saved: {p} ({export_punches(p, rows)} punches)')
+        except Exception as e: messagebox.showerror('Punch logs', str(e))
+
+
+ttk.Button(pgb, text='Show', style='Primary.TButton', command=show_punches).pack(side='left'); ttk.Button(pgb, text='Download punch logs (Excel)', command=dl_punches).pack(side='left', padx=8)
+tk.Label(pgb, textvariable=pg_info, bg='white', fg=MUTED, font=('Segoe UI', 9)).pack(side='left', padx=8)
+pgw = tk.Frame(p1, bg='white'); pgw.pack(fill='x', pady=(8, 0))
+pg_cols = (('id', 'Ac-No', 110), ('name', 'Name', 200), ('time', 'Time', 170), ('machine', 'Machine', 150), ('mode', 'Verify Mode', 110))
+pg_tree = ttk.Treeview(pgw, columns=[c[0] for c in pg_cols], show='headings', height=7)
+for k, t, w in pg_cols: pg_tree.heading(k, text=t); pg_tree.column(k, width=w, anchor='w')
+pg_sc = ttk.Scrollbar(pgw, orient='vertical', command=pg_tree.yview); pg_tree.configure(yscrollcommand=pg_sc.set); pg_tree.pack(side='left', fill='x', expand=True); pg_sc.pack(side='right', fill='y')
+
 r1o, r1c = make_card(br, 'Activity and deletion reports'); r1o.pack(fill='both', expand=True, padx=12, pady=(6, 10))
 rf, rt, rtype, rinfo = tk.StringVar(value=f'{date.today():%d-%m-%Y}'), tk.StringVar(value=f'{date.today():%d-%m-%Y}'), tk.StringVar(value='All'), tk.StringVar()
 rbar = tk.Frame(r1c, bg='white'); rbar.pack(fill='x')
@@ -2066,6 +2321,11 @@ box = tk.Text(lo_b, height=3, font=('Consolas', 9), bg='#111111', fg='#f2f2f2', 
 lo_o.pack(side='bottom', fill='x', padx=12, pady=(0, 10), before=nb)
 
 
+def info_vals(ip):
+    m = MINFO.get(ip) or {}
+    return ['-' if m.get(k) is None else f'{m[k]:,}' for k in ('users', 'fp', 'face', 'logs')]
+
+
 def conn_text(ip):
     ms = MSTAT.get(ip) if ip else None
     if not ip: return '-', MUTED
@@ -2082,8 +2342,10 @@ def poll():
     tick[0] += 1
     WATCH[:] = [enr.get().strip()] + [r['ip'].get().strip() for r in mrows]
     t, c = conn_text(enr.get().strip()); enr_st.config(text=t, fg=c); enr_last.config(text=(MSTAT.get(enr.get().strip()) or {}).get('last', ''))
+    ev_ = info_vals(enr.get().strip()); enr_info.config(text=f'UserCount {ev_[0]}   |   Fp Count {ev_[1]}   |   Fc Count {ev_[2]}   |   Log Count {ev_[3]}' if enr.get().strip() in MINFO else '')
     for r in mrows:
         ip = r['ip'].get().strip(); t, c = conn_text(ip); r['st'].config(text=t, fg=c); r['last'].config(text=(MSTAT.get(ip) or {}).get('last', ''))
+        for lb_, v_ in zip(r['cnt'], info_vals(ip)): lb_.config(text=v_)
     run = bool(auto_t[0] and auto_t[0].is_alive() and not STOP.is_set())
     pill.config(text='\u25cf  RUNNING' if run else '\u25cf  STOPPED', bg=RED if run else '#eeeeee', fg='white' if run else INK)
     list_status.set(f'{LIST["result"]}\nLast update: {LIST["time"]}' + (f'   |   next download {datetime.fromtimestamp(LIST["next"]):%H:%M}' if LIST['next'] > time.time() else '') + f'   |   {LIST["cols"] or "columns not detected yet"}'
