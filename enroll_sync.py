@@ -181,14 +181,16 @@ def backup_stats():
         c.close()
 
 
-def query_events(d1, d2, kinds=None):
+def query_events(d1, d2, kinds=None, uid=''):
     c = db()
     try:
         sql, args = 'SELECT ts, kind, uid, name, machine, detail FROM events WHERE day >= ? AND day <= ?', [d1.isoformat(), d2.isoformat()]
         if kinds: sql += ' AND kind IN (%s)' % ','.join('?' * len(kinds)); args += kinds
-        return c.execute(sql + ' ORDER BY ts', args).fetchall()
+        rows = c.execute(sql + ' ORDER BY ts', args).fetchall()
     finally:
         c.close()
+    terms = [t for t in re.split(r'[;,\s]+', uid.strip()) if t]
+    return [r for r in rows if any(norm(t) == norm(r[2]) for t in terms)] if terms else rows
 
 
 VERIFY_NAME = {0: 'PW', 1: 'FP', 2: 'RF', 3: 'PW', 4: 'RF', 15: 'FACE'}     # verify mode of a punch as the machine reports it: RF = RFID card
@@ -236,11 +238,11 @@ def export_punches(path, rows):
     wb.save(path); return len(rows)
 
 
-def export_report(path, d1, d2, kinds=None):
+def export_report(path, d1, d2, kinds=None, uid=''):
     import openpyxl
     wb = openpyxl.Workbook(); ws = wb.active; ws.title = 'Activity'
     ws.append(['Date', 'Time', 'Type', 'Employee ID', 'Name', 'Machine', 'Details'])
-    rows = query_events(d1, d2, kinds)
+    rows = query_events(d1, d2, kinds, uid)
     for ts, kind, uid, name, mach, det in rows: ws.append([ts[:10], ts[11:], KIND_LABEL.get(kind, kind), uid, name, mach, det])
     sm = wb.create_sheet('Summary'); sm.append(['Date', 'Type', 'Count'])
     cnt = {}
@@ -1124,7 +1126,7 @@ class Dev:
     """One machine through the ZKTeco SDK (COM object zkemkeeper.ZKEM)."""
     def __init__(self, ip, port, key):
         import pythoncom
-        pythoncom.CoInitialize(); self._co = pythoncom; self.ip, self.card_err = ip, ''
+        pythoncom.CoInitialize(); self._co = pythoncom; self.ip, self.card_err, self.count_err = ip, '', ''
         from win32com.client import Dispatch, gencache
         try: self.z = gencache.EnsureDispatch('zkemkeeper.ZKEM')
         except Exception: self.z = Dispatch('zkemkeeper.ZKEM')
@@ -1180,12 +1182,17 @@ class Dev:
 
     def counts(self):
         """The numbers the machine shows itself: registered users, fingerprint templates, face templates, attendance records."""
-        out = {}
+        out, self.count_err = {}, ''
         for k, code in (('users', 2), ('fp', 3), ('face', 21), ('logs', 6)):
-            try:
-                r = self.z.GetDeviceStatus(1, code)                  # (ok, value) - the flag is not reliable on these machines, the value is
-                v = int(r[-1] if isinstance(r, tuple) else r); out[k] = v if (v > 0 or not isinstance(r, tuple) or r[0]) else None
-            except Exception: out[k] = None
+            v = None
+            for args in ((1, code), (1, code, 0)):                 # some SDK versions want the (out) value as an argument too
+                try:
+                    r = self.z.GetDeviceStatus(*args)              # (ok, value) - the flag is not reliable on these machines, the value is
+                    x = int(r[-1] if isinstance(r, tuple) else r)
+                    if x > 0 or not isinstance(r, tuple) or r[0]: v = x
+                    break
+                except Exception as e: self.count_err = self.count_err or repr(e)
+            out[k] = v
         return out
 
     def logs(self):
@@ -1234,6 +1241,7 @@ class Dev:
 
 
 # ---------------------------------------------------------------- machine connectivity (shown next to every machine)
+COUNT_LOGGED = set()
 MINFO = {}                                         # ip -> {'users', 'fp', 'face', 'logs', 'time'}  as the machine itself reports them
 MSTAT, WATCH = {}, []                              # ip -> {'online', 'last'};  WATCH = IPs to check (kept up to date by the window)
 
@@ -1318,11 +1326,17 @@ def sync_target(name, ip, cfg, users, tmpl, removed=frozenset(), leavers=frozens
             except Exception: pass
         try: r['scanned'] = backup_scan(d, name, dst, full_scan)           # backup of what is already on the machine
         except Exception as e: log(f'{name}: backup scan failed ({e})')
+        recs = []
         try:                                                                         # every punch of the machine goes into the database
             recs = d.logs(); new = save_punches([(ts, ts[:10], uid, names.get(uid) or uid, name, ip, VERIFY_NAME.get(vm, f'Mode {vm}'), io) for uid, ts, vm, io in recs]) if recs else 0
             if new: log(f'{name} {ip}: +{new} punch logs')
         except Exception as e: log(f'{name}: punch logs failed ({e})')
-        try: MINFO[ip] = dict(d.counts(), time=time.time())
+        try:
+            c = d.counts()
+            if c.get('users') is None: c['users'] = len(dst)                          # the machine did not answer: what we read from it ourselves
+            if c.get('logs') is None and recs: c['logs'] = len(recs)
+            MINFO[ip] = dict(c, time=time.time())
+            if c.get('fp') is None and ip not in COUNT_LOGGED: COUNT_LOGGED.add(ip); log(f'{ip}: the machine does not give the fingerprint / face counts ({d.count_err})')
         except Exception: pass
         return r
     finally:
@@ -1689,7 +1703,7 @@ def _walk(w):
 
 
 def apply_lock():
-    try: free = {str(rf), str(rt), str(qs), str(pg_from), str(pg_to), str(pg_id), str(del_ids)}                                                               # the report date filters only choose what to look at
+    try: free = {str(rf), str(rt), str(rid), str(qs), str(pg_from), str(pg_to), str(pg_id), str(del_ids)}                                                               # the report date filters only choose what to look at
     except NameError: free = set()
     st = ['!disabled'] if EDIT['on'] else ['disabled']
     for w in _walk(root):
@@ -1867,7 +1881,11 @@ def refresh_counts():
             for m in [x for x in cfg['machines'] if x['ip']]:
                 try:
                     d = Dev(m['ip'], cfg['port'], cfg['comm_key'])
-                    try: MINFO[m['ip']] = dict(d.counts(), time=time.time())
+                    try:
+                        c = d.counts()
+                        if c.get('users') is None: c['users'] = len(d.users())
+                        if c.get('logs') is None: c['logs'] = len(d.logs())
+                        MINFO[m['ip']] = dict(c, time=time.time())
                     finally: d.close()
                 except Exception as e: log(f'{m["name"]} {m["ip"]}: counts failed ({e})')
         finally: busy.release()
@@ -2167,13 +2185,13 @@ tk.Label(s1, textvariable=qtr, bg='white', fg=INK, font=FN, justify='left', wrap
 
 # ---- attendance punch logs: every punch of every machine
 p1o, p1 = make_card(br, 'Attendance punch logs  (every punch of every machine - also sent by e-mail as an Excel file)'); p1o.pack(fill='x', padx=12, pady=6)
-pg_from, pg_to, pg_mach, pg_id, pg_info = tk.StringVar(value=f'{date.today():%d-%m-%Y}'), tk.StringVar(value=f'{date.today():%d-%m-%Y}'), tk.StringVar(value='All machines'), tk.StringVar(), tk.StringVar()
+pg_from, pg_to, pg_mach, pg_id, pg_info = tk.StringVar(value=f'{date.today() - timedelta(days=30):%d-%m-%Y}'), tk.StringVar(value=f'{date.today():%d-%m-%Y}'), tk.StringVar(value='All machines'), tk.StringVar(), tk.StringVar()
 pgb = tk.Frame(p1, bg='white'); pgb.pack(fill='x')
 lbl(pgb, 'From').pack(side='left'); ttk.Entry(pgb, textvariable=pg_from, width=12, justify='center').pack(side='left', padx=(6, 12))
 lbl(pgb, 'To').pack(side='left'); ttk.Entry(pgb, textvariable=pg_to, width=12, justify='center').pack(side='left', padx=(6, 12))
 lbl(pgb, 'Machine').pack(side='left'); pg_cb = ttk.Combobox(pgb, textvariable=pg_mach, width=16, state='readonly', postcommand=lambda: pg_cb.config(values=['All machines'] + [r['name'].get().strip() for r in mrows if r['name'].get().strip()]))
 pg_cb.pack(side='left', padx=(6, 12))
-lbl(pgb, 'Employee ID').pack(side='left'); ttk.Entry(pgb, textvariable=pg_id, width=14).pack(side='left', padx=(6, 12))
+lbl(pgb, 'Employee ID', fg=INK, font=FB).pack(side='left'); pg_en = ttk.Entry(pgb, textvariable=pg_id, width=14); pg_en.pack(side='left', padx=(6, 12)); pg_en.bind('<Return>', lambda _e: show_punches())
 
 
 def pg_rows():
@@ -2209,11 +2227,12 @@ for k, t, w in pg_cols: pg_tree.heading(k, text=t); pg_tree.column(k, width=w, a
 pg_sc = ttk.Scrollbar(pgw, orient='vertical', command=pg_tree.yview); pg_tree.configure(yscrollcommand=pg_sc.set); pg_tree.pack(side='left', fill='x', expand=True); pg_sc.pack(side='right', fill='y')
 
 r1o, r1c = make_card(br, 'Activity and deletion reports'); r1o.pack(fill='both', expand=True, padx=12, pady=(6, 10))
-rf, rt, rtype, rinfo = tk.StringVar(value=f'{date.today():%d-%m-%Y}'), tk.StringVar(value=f'{date.today():%d-%m-%Y}'), tk.StringVar(value='All'), tk.StringVar()
+rf, rt, rtype, rinfo, rid = tk.StringVar(value=f'{date.today():%d-%m-%Y}'), tk.StringVar(value=f'{date.today():%d-%m-%Y}'), tk.StringVar(value='All'), tk.StringVar(), tk.StringVar()
 rbar = tk.Frame(r1c, bg='white'); rbar.pack(fill='x')
 lbl(rbar, 'From').pack(side='left'); ttk.Entry(rbar, textvariable=rf, width=12, justify='center').pack(side='left', padx=(6, 14))
 lbl(rbar, 'To').pack(side='left'); ttk.Entry(rbar, textvariable=rt, width=12, justify='center').pack(side='left', padx=(6, 14))
 lbl(rbar, 'Show').pack(side='left'); ttk.Combobox(rbar, textvariable=rtype, values=list(KIND_FILTER), width=11, state='readonly').pack(side='left', padx=(6, 14))
+lbl(rbar, 'Employee ID').pack(side='left'); ttk.Entry(rbar, textvariable=rid, width=12).pack(side='left', padx=(6, 14))
 
 
 def get_range():
@@ -2224,7 +2243,7 @@ def get_range():
 def show_report():
     rg = get_range()
     if not rg: return
-    flush_events(); rows = query_events(rg[0], rg[1], KIND_FILTER[rtype.get()]); tree.delete(*tree.get_children())
+    flush_events(); rows = query_events(rg[0], rg[1], KIND_FILTER[rtype.get()], rid.get()); tree.delete(*tree.get_children())
     for r in rows[-2000:]: tree.insert('', 'end', values=(r[0], KIND_LABEL.get(r[1], r[1]), r[2], r[3], r[4], r[5]))
     rinfo.set(f'{len(rows)} entries' + ('  (last 2000 shown - the Excel file has all)' if len(rows) > 2000 else ''))
 
@@ -2235,7 +2254,7 @@ def dl_report():
     p = save_as('Save report', f'Activity_Report_{rg[0]:%Y-%m-%d}_{rg[1]:%Y-%m-%d}.xlsx', '.xlsx')
     if p:
         flush_events()
-        try: log(f'Report saved: {p} ({export_report(p, rg[0], rg[1], KIND_FILTER[rtype.get()])} entries)')
+        try: log(f'Report saved: {p} ({export_report(p, rg[0], rg[1], KIND_FILTER[rtype.get()], rid.get())} entries)')
         except Exception as e: messagebox.showerror('Report', str(e))
 
 
