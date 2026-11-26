@@ -89,6 +89,7 @@ if not cfg.get('machines'):                                                   # 
         on = bool(r.get('ip')) if m['name'].startswith('IN') else r.get('on', True)
         ms.append({'name': m['name'], 'ip': r.get('ip', ''), 'on': on})
     cfg['machines'] = ms
+for _m in cfg['machines']: _m.setdefault('logs', bool(_m.get('on', True)))      # older settings: the punch logs follow the old tick
 
 
 def norm(s):
@@ -1328,8 +1329,10 @@ def sync_target(name, ip, cfg, users, tmpl, removed=frozenset(), leavers=frozens
         except Exception as e: log(f'{name}: backup scan failed ({e})')
         recs = []
         try:                                                                         # every punch of the machine goes into the database
+            if not next((m.get('logs', True) for m in cfg['machines'] if m['ip'] == ip), True): raise StopIteration
             recs = d.logs(); new = save_punches([(ts, ts[:10], uid, names.get(uid) or uid, name, ip, VERIFY_NAME.get(vm, f'Mode {vm}'), io) for uid, ts, vm, io in recs]) if recs else 0
             if new: log(f'{name} {ip}: +{new} punch logs')
+        except StopIteration: pass                                                  # Punch logs not ticked for this machine
         except Exception as e: log(f'{name}: punch logs failed ({e})')
         try:
             c = d.counts()
@@ -1430,6 +1433,28 @@ def run_cycle(cfg, targets, allow_bulk, force=False, leavers=frozenset(), full_s
     finally:
         src.close(); flush_events()
     return did_full
+
+
+# ---------------------------------------------------------------- machines that are connected for the punch logs only
+def log_only_machines(cfg): return [m for m in cfg['machines'] if m['ip'] and m.get('logs', True) and not m.get('on')]
+
+
+def collect_logs_only(cfg):
+    """Enroll not ticked, Punch logs ticked: read the attendance records and the counts. Nothing is changed on the machine."""
+    for m in log_only_machines(cfg):
+        if STOP.is_set(): break
+        name, ip = m['name'], m['ip']
+        try:
+            d = Dev(ip, cfg['port'], cfg['comm_key'])
+            try:
+                recs = d.logs(); new = save_punches([(ts, ts[:10], uid, uid, name, ip, VERIFY_NAME.get(vm, f'Mode {vm}'), io) for uid, ts, vm, io in recs]) if recs else 0
+                c = d.counts()
+                if c.get('logs') is None and recs: c['logs'] = len(recs)
+                MINFO[ip] = dict(c, time=time.time())
+            finally: d.close()
+            set_last(ip, f'punch logs only: +{new}  ({datetime.now():%H:%M})')
+            if new: log(f'{name} {ip}: +{new} punch logs')
+        except Exception as e: set_last(ip, f'FAILED ({e})'); log(f'{name} {ip}: punch logs FAILED ({e})')
 
 
 # ---------------------------------------------------------------- delete an employee from every machine at once
@@ -1820,7 +1845,7 @@ enr_info = lbl(c1, '', font=('Segoe UI', 9)); enr_info.pack(anchor='w', pady=(4,
 
 c2o, c2 = make_card(bc, 'Machines  (IN / OUT / Colony gates)'); c2o.pack(fill='x', padx=12, pady=6)
 minner = tk.Frame(c2, bg='white'); minner.pack(fill='x')
-for c, t in enumerate(('Use', 'Machine name', 'IP address', 'Connectivity', 'UserCount', 'Fp Count', 'Fc Count', 'Log Count', 'Last sync', '')): lbl(minner, t, font=('Segoe UI', 9, 'bold')).grid(row=0, column=c, sticky='w', padx=(0, 8), pady=(0, 4))
+for c, t in enumerate(('Enroll', 'Punch logs', 'Machine name', 'IP address', 'Connectivity', 'UserCount', 'Fp Count', 'Fc Count', 'Log Count', 'Last sync', '')): lbl(minner, t, font=('Segoe UI', 9, 'bold')).grid(row=0, column=c, sticky='w', padx=(0, 8), pady=(0, 4))
 mrows = []
 
 
@@ -1830,10 +1855,10 @@ def regrid():
 
 
 def add_row(m=None):
-    m = m or {'name': f'Machine {len(mrows) + 1}', 'ip': '', 'on': True}
-    r = {'on': tk.BooleanVar(value=bool(m.get('on', True))), 'name': tk.StringVar(value=m.get('name', '')), 'ip': tk.StringVar(value=m.get('ip', ''))}
+    m = m or {'name': f'Machine {len(mrows) + 1}', 'ip': '', 'on': True, 'logs': True}
+    r = {'on': tk.BooleanVar(value=bool(m.get('on', True))), 'logs': tk.BooleanVar(value=bool(m.get('logs', True))), 'name': tk.StringVar(value=m.get('name', '')), 'ip': tk.StringVar(value=m.get('ip', ''))}
     r['st'] = lbl(minner, '-', width=14, anchor='w'); r['last'] = lbl(minner, '', font=('Segoe UI', 9), width=30, anchor='w'); r['cnt'] = [lbl(minner, '-', width=9, anchor='center', fg=INK) for _ in range(4)]
-    r['w'] = [ttk.Checkbutton(minner, variable=r['on'], style='Card.TCheckbutton'), ttk.Entry(minner, textvariable=r['name'], width=16), ttk.Entry(minner, textvariable=r['ip'], width=16),
+    r['w'] = [ttk.Checkbutton(minner, variable=r['on'], style='Card.TCheckbutton'), ttk.Checkbutton(minner, variable=r['logs'], style='Card.TCheckbutton'), ttk.Entry(minner, textvariable=r['name'], width=16), ttk.Entry(minner, textvariable=r['ip'], width=16),
               r['st'], *r['cnt'], r['last'], ttk.Button(minner, text='\u2715', width=3, style='Ghost.TButton', command=lambda r=r: remove_row(r))]
     mrows.append(r); regrid(); apply_lock()
 
@@ -1846,7 +1871,8 @@ def remove_row(r):
 for _m in cfg['machines']: add_row(_m)
 mb = tk.Frame(c2, bg='white'); mb.pack(fill='x', pady=(8, 0))
 ttk.Button(mb, text='+ Add machine', command=lambda: add_row()).pack(side='left'); ttk.Button(mb, text='Refresh counts', command=lambda: refresh_counts()).pack(side='left', padx=(8, 0))
-note(mb, 'Tick = this machine receives the enrollments.  \u2715 = remove the machine from the list.', wrap=700).pack(side='left', padx=14)
+note(mb, 'Enroll = this machine receives the new enrollments from the Enroller (users, fingerprints, faces, cards).  Punch logs = the attendance records of this machine are collected. '
+         'Only Punch logs ticked = the machine is connected for the logs only, nothing is ever changed on it.  \u2715 = remove the machine from the list.', wrap=640).pack(side='left', padx=14)
 
 c3o, c3 = make_card(bc, 'Options'); c3o.pack(fill='x', padx=12, pady=6)
 r3 = tk.Frame(c3, bg='white'); r3.pack(fill='x')
@@ -1927,7 +1953,7 @@ def save():
                    mail_pass=mail_pass.get(), mail_time=mt)
     except ValueError:
         messagebox.showerror('Check settings', 'Seconds, minutes, Comm Key and port must be numbers, and the e-mail time must look like 20:00'); return False
-    new['machines'] = [{'name': r['name'].get().strip() or 'Machine', 'ip': r['ip'].get().strip(), 'on': r['on'].get()} for r in mrows]
+    new['machines'] = [{'name': r['name'].get().strip() or 'Machine', 'ip': r['ip'].get().strip(), 'on': r['on'].get(), 'logs': r['logs'].get()} for r in mrows]
     new['backup_dir'] = '' if bdir.get().strip() == os.path.dirname(os.path.join(APP, 'Backup', 'x')) else bdir.get().strip()
     changed = any(cfg.get(k) != v for k, v in new.items())
     if changed and not EDIT['on'] and not ask_password('Save the changed settings'): return False
@@ -1941,14 +1967,17 @@ def cycle(force=False, list_now=False, full=False):
     try:
         if cfg['list_url'].strip() and (list_now or time.time() >= LIST['next']): refresh_list(cfg, manual=list_now)          # the employee list is refreshed on its own timer
         due = time.time() - float(cfg.get('last_full') or 0) > float(cfg['scan_hours']) * 3600
-        if run_cycle(cfg, targets(), cfg['bulk'], force, leavers_now(cfg), full or due): cfg['last_full'] = time.time(); save_json(CFG_FILE, cfg)
+        try:
+            if cfg['enroller'] and targets() and run_cycle(cfg, targets(), cfg['bulk'], force, leavers_now(cfg), full or due): cfg['last_full'] = time.time(); save_json(CFG_FILE, cfg)
+        finally: collect_logs_only(cfg)                                       # machines that are only used for the punch logs
     except Exception as e: log(f'Error: {e}')
     finally: busy.release()
 
 
 def sync_now(force=False, full=False):
     if not save(): return
-    if not cfg['enroller']: messagebox.showinfo('Enroll Sync', 'Enter the Enroller Machine IP'); return
+    if targets() and not cfg['enroller']: messagebox.showinfo('Enroll Sync', 'Enter the Enroller Machine IP'); return
+    if not targets() and not log_only_machines(cfg): messagebox.showinfo('Enroll Sync', 'Enter at least one machine IP and tick Enroll or Punch logs'); return
     if not (auto_t[0] and auto_t[0].is_alive()): STOP.clear()
     threading.Thread(target=cycle, args=(force, True, full), daemon=True).start()
 
@@ -1961,7 +1990,8 @@ def loop():
 
 def start_auto():
     if not save(): return
-    if not cfg['enroller'] or not targets(): messagebox.showinfo('Enroll Sync', 'Enter the Enroller IP and at least one machine IP (ticked)'); return
+    if targets() and not cfg['enroller']: messagebox.showinfo('Enroll Sync', 'Enter the Enroller IP (needed for the machines with Enroll ticked)'); return
+    if not targets() and not log_only_machines(cfg): messagebox.showinfo('Enroll Sync', 'Enter at least one machine IP and tick Enroll or Punch logs'); return
     if auto_t[0] and auto_t[0].is_alive() and not STOP.is_set(): log('Auto sync is already running.'); return
     STOP.clear(); auto_t[0] = threading.Thread(target=loop, daemon=True); auto_t[0].start(); log(f'Auto sync started (every {cfg["interval"]} s)')
 
